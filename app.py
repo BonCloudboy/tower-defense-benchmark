@@ -156,11 +156,11 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
     
     system_prompt = (
         "You are a Tower Defense decision-making AI. "
-        "You receive the current game state and must decide ONE of three actions each wave: "
-        "BUILD a new tower, UPGRADE an existing tower, or DO_NOTHING. "
+        "Return only valid JSON with no code fences (no ```). "
         "Your response MUST be valid JSON with the structure described. "
         "Do not include any extra keys or commentary."
     )
+
     
     # Summarize the wave:
     enemy_summary = {}
