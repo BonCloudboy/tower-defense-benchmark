@@ -37,23 +37,22 @@ openai.api_key = openai_api_key
 TOWER_TYPES = {
     "Cannon": {
         "cost": 100,
+        "upgrade_cost": 50,  # Added this field
         "range": 2,
         "base_damage": 10,
-        # Multipliers vs each enemy type: 
-        # e.g. Cannon does half damage vs Armored, can't hit Flying
         "damage_mods": {
             "Basic": 1.0,
             "Fast": 1.0,
             "Tank": 0.8,
             "Armored": 0.5,
-            "Flying": 0.0  # can't hit flying
+            "Flying": 0.0
         }
     },
     "Archer": {
         "cost": 75,
+        "upgrade_cost": 50,  # Added this field
         "range": 3,
         "base_damage": 7,
-        # Archer can hit flying, does normal damage to armor:
         "damage_mods": {
             "Basic": 1.0,
             "Fast": 1.0,
@@ -64,9 +63,9 @@ TOWER_TYPES = {
     },
     "Laser": {
         "cost": 150,
+        "upgrade_cost": 75,  # Added this field (more expensive for stronger tower)
         "range": 2,
         "base_damage": 15,
-        # Laser is very effective vs Armored, but cannot target Flying:
         "damage_mods": {
             "Basic": 1.0,
             "Fast": 1.0,
@@ -75,8 +74,8 @@ TOWER_TYPES = {
             "Flying": 0.0
         }
     }
-    # You can add more tower types here if desired.
 }
+
 
 # You can add or modify enemy types as you like:
 # (enemy_type, health, speed, reward)
@@ -103,19 +102,24 @@ class Tower:
         # Pull stats from TOWER_TYPES:
         tower_data = TOWER_TYPES[tower_type]
         self.base_cost = tower_data["cost"]
+        self.upgrade_cost = tower_data["upgrade_cost"]
         self.range_ = tower_data["range"]
         self.base_damage = tower_data["base_damage"]
         self.damage_mods = tower_data["damage_mods"]
 
-        # Actual cost so that an upgrade can modify:
         self.current_cost = self.base_cost
+
+    def get_current_upgrade_cost(self) -> int:
+        """Calculate the cost of the next upgrade based on current level."""
+        return self.upgrade_cost + (self.level - 1) * 25
 
     def upgrade(self):
         self.level += 1
-        # Example upgrade approach:
-        # - Increase base damage a bit each time
-        # - Increase cost for next upgrade
-        # - Possibly also extend range slightly
+        self.base_damage += 3
+        self.range_ += 0 if self.level % 2 == 0 else 1
+
+    def upgrade(self):
+        self.level += 1
         self.base_damage += 3
         self.range_ += 0 if self.level % 2 == 0 else 1  # +1 range every other level
         self.current_cost += 50
@@ -382,7 +386,8 @@ def get_llm_decision(state: GameState,
             "level": t.level,
             "range": t.range_,
             "base_damage": t.base_damage,
-            "position": [t.x, t.y]
+            "position": [t.x, t.y],
+            "upgrade_cost": t.get_current_upgrade_cost()
         })
 
     # Buildable positions
@@ -404,8 +409,14 @@ def get_llm_decision(state: GameState,
     for ttype, data in TOWER_TYPES.items():
         tower_type_options[ttype] = {
             "cost": data["cost"],
+            "upgrade_cost": data["upgrade_cost"],
             "range": data["range"],
-            "base_damage": data["base_damage"]
+            "base_damage": data["base_damage"],
+            "upgrade_effects": {
+                "damage": "+3 base damage per level",
+                "range": "+1 range every odd level (levels 3, 5, 7, etc.)",
+                "cost_scaling": f"Upgrade cost starts at {data['upgrade_cost']} and increases by 25 gold per level"
+            }
         }
 
     user_prompt = (
@@ -500,15 +511,16 @@ def parse_llm_action(state: GameState, llm_raw_json: str):
         if not tower_id or (tower_id not in state.towers):
             print("LLM tried UPGRADE with invalid tower_id.")
             return
-        # Let's say each upgrade costs 50 gold:
-        upgrade_cost = 50
+            
+        tower = state.towers[tower_id]
+        upgrade_cost = tower.get_current_upgrade_cost()
+        
         if state.gold >= upgrade_cost:
-            t = state.towers[tower_id]
-            t.upgrade()
+            tower.upgrade()
             state.gold -= upgrade_cost
-            print(f"Upgraded Tower #{tower_id} (Type: {t.tower_type}) to Level {t.level}. Gold left: {state.gold}")
+            print(f"Upgraded Tower #{tower_id} (Type: {tower.tower_type}) to Level {tower.level}. Cost: {upgrade_cost}. Gold left: {state.gold}")
         else:
-            print("LLM chose UPGRADE, but insufficient gold.")
+            print(f"LLM chose UPGRADE, but insufficient gold (need {upgrade_cost}).")
 
 
 def is_buildable(state: GameState, x: int, y: int) -> bool:
