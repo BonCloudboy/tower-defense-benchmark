@@ -22,7 +22,8 @@ logging.basicConfig(
 )
 
 # ---------------------------------------------------------------------
-#  OpenAI Setup (Using the older call style)
+#  OpenAI Setup
+#  (Uses older `openai.chat.completions.create` as requested)
 # ---------------------------------------------------------------------
 openai_api_key = os.getenv('OPENAI_API_KEY')
 openai_org = os.getenv('OPENAI_ORG')
@@ -31,34 +32,102 @@ openai.organization = openai_org
 openai.api_key = openai_api_key
 
 # ---------------------------------------------------------------------
+#  Tower & Enemy Metadata
+# ---------------------------------------------------------------------
+TOWER_TYPES = {
+    "Cannon": {
+        "cost": 100,
+        "range": 2,
+        "base_damage": 10,
+        # Multipliers vs each enemy type: 
+        # e.g. Cannon does half damage vs Armored, can't hit Flying
+        "damage_mods": {
+            "Basic": 1.0,
+            "Fast": 1.0,
+            "Tank": 0.8,
+            "Armored": 0.5,
+            "Flying": 0.0  # can't hit flying
+        }
+    },
+    "Archer": {
+        "cost": 75,
+        "range": 3,
+        "base_damage": 7,
+        # Archer can hit flying, does normal damage to armor:
+        "damage_mods": {
+            "Basic": 1.0,
+            "Fast": 1.0,
+            "Tank": 0.6,
+            "Armored": 1.0,
+            "Flying": 1.0
+        }
+    },
+    "Laser": {
+        "cost": 150,
+        "range": 2,
+        "base_damage": 15,
+        # Laser is very effective vs Armored, but cannot target Flying:
+        "damage_mods": {
+            "Basic": 1.0,
+            "Fast": 1.0,
+            "Tank": 1.5,
+            "Armored": 2.0,
+            "Flying": 0.0
+        }
+    }
+    # You can add more tower types here if desired.
+}
+
+# You can add or modify enemy types as you like:
+# (enemy_type, health, speed, reward)
+# We'll dynamically generate waves, but these are reference stats.
+ENEMY_TYPE_STATS = {
+    "Basic":   {"health": 15, "speed": 1, "reward": 5},
+    "Fast":    {"health": 12, "speed": 2, "reward": 6},
+    "Tank":    {"health": 40, "speed": 1, "reward": 10},
+    "Armored": {"health": 25, "speed": 1, "reward": 7},
+    "Flying":  {"health": 10, "speed": 3, "reward": 8}
+}
+
+# ---------------------------------------------------------------------
 #  Game Classes
 # ---------------------------------------------------------------------
 class Tower:
-    def __init__(
-        self,
-        tower_id: int,
-        x: int,
-        y: int,
-        tower_type: str = "Cannon",
-        level: int = 1,
-        range_: int = 2,
-        damage: int = 10,
-        cost: int = 100
-    ):
+    def __init__(self, tower_id: int, x: int, y: int, tower_type: str):
         self.tower_id = tower_id
         self.x = x
         self.y = y
         self.tower_type = tower_type
-        self.level = level
-        self.range_ = range_
-        self.damage = damage
-        self.cost = cost
+        self.level = 1
+
+        # Pull stats from TOWER_TYPES:
+        tower_data = TOWER_TYPES[tower_type]
+        self.base_cost = tower_data["cost"]
+        self.range_ = tower_data["range"]
+        self.base_damage = tower_data["base_damage"]
+        self.damage_mods = tower_data["damage_mods"]
+
+        # Actual cost so that an upgrade can modify:
+        self.current_cost = self.base_cost
 
     def upgrade(self):
         self.level += 1
-        self.damage += 5
-        self.range_ += 1
-        self.cost += 50
+        # Example upgrade approach:
+        # - Increase base damage a bit each time
+        # - Increase cost for next upgrade
+        # - Possibly also extend range slightly
+        self.base_damage += 3
+        self.range_ += 0 if self.level % 2 == 0 else 1  # +1 range every other level
+        self.current_cost += 50
+
+    def get_damage_against(self, enemy_type: str) -> float:
+        """
+        Calculate how much damage this tower does against the given enemy type,
+        applying the appropriate multipliers and level scaling.
+        """
+        multiplier = self.damage_mods.get(enemy_type, 1.0)
+        # e.g. each level adds +3 to base, so total is base_damage * multiplier
+        return self.base_damage * multiplier
 
 
 class Enemy:
@@ -94,8 +163,12 @@ class GameState:
         self.health = 20
         self.wave_number = 0
         
-        # We'll assign the waves later using generate_waves()
-        self.waves = []
+        # Wave data assigned later by generate_waves()
+        self.waves: List[List[Enemy]] = []
+
+        # This dictionary will track how many enemies of each type got through
+        # in the *previous* wave. Use this to inform the LLM about weaknesses.
+        self.last_wave_leaks: Dict[str, int] = {}
 
     def print_map(self):
         """Simple console print to see towers / layout."""
@@ -109,58 +182,76 @@ class GameState:
         print()
 
 # ---------------------------------------------------------------------
-#  Steeper Wave Generation
+#  Steep Wave Generation Example
 # ---------------------------------------------------------------------
 def generate_waves(num_waves: int) -> List[List[Tuple[str, int, int, int]]]:
     """
-    Generate a list of waves with a steeper difficulty curve.
-    
-    Each wave is a list of tuples:
-        (enemy_type, health, speed, reward)
-
-    For a steeper curve, we significantly ramp up health, speed, and
-    the number of enemies as wave_index increases.
+    Generate a list of waves with various enemy types,
+    each wave is a list of (enemy_type, health, speed, reward).
+    We'll escalate difficulty more quickly.
     """
-    waves = []
+    all_waves = []
     for i in range(num_waves):
-        # Wave index i => wave number (i + 1)
-        # Basic enemies
-        # Increase count and health at a faster rate
-        basic_count = 3 + (i * 2)          # grows 3,5,7,9,...
-        basic_health = 12 + (i * 5)        # grows from 12 up by 5 each wave
-        basic_speed = 1 + (i // 2)         # speed up every 2 waves
-        basic_reward = 6 + (i // 3)        # slightly better reward every 3 waves
-
         wave_enemies = []
+        
+        # Basic enemies scale
+        basic_count = 3 + (i * 2)
+        basic_health = ENEMY_TYPE_STATS["Basic"]["health"] + i * 4
+        basic_speed  = ENEMY_TYPE_STATS["Basic"]["speed"] + (i // 3)
+        basic_reward = ENEMY_TYPE_STATS["Basic"]["reward"] + (i // 3)
         for _ in range(basic_count):
             wave_enemies.append(("Basic", basic_health, basic_speed, basic_reward))
-
-        # Fast enemies (start adding around wave 2)
+        
+        # Fast enemies (start from wave 1)
         if i >= 1:
-            fast_count = 1 + (i // 2)      # 1 fast enemy at wave 2, 2 fast at wave 4, etc.
-            fast_health = 10 + i * 3
-            fast_speed = 2 + (i // 3)      # speeds up every 3 waves
-            fast_reward = 7 + (i // 2)
+            fast_count  = 1 + (i // 2)
+            fast_health = ENEMY_TYPE_STATS["Fast"]["health"] + i * 2
+            fast_speed  = ENEMY_TYPE_STATS["Fast"]["speed"] + (i // 4)
+            fast_reward = ENEMY_TYPE_STATS["Fast"]["reward"] + (i // 2)
             for _ in range(fast_count):
                 wave_enemies.append(("Fast", fast_health, fast_speed, fast_reward))
 
-        # Heavy/Tank enemies (start adding around wave 4)
-        if i >= 3:
-            tank_count = 1 + (i // 3)      # bigger, slower enemies appear from wave 4 on
-            tank_health = 30 + (i * 10)
-            tank_speed = 1 + (i // 4)      # still slow, but speeds up very gradually
-            tank_reward = 15 + (i // 2)
+        # Tank enemies (start from wave 2)
+        if i >= 2:
+            tank_count  = 1 + (i // 3)
+            tank_health = ENEMY_TYPE_STATS["Tank"]["health"] + i * 8
+            tank_speed  = ENEMY_TYPE_STATS["Tank"]["speed"] + (i // 5)
+            tank_reward = ENEMY_TYPE_STATS["Tank"]["reward"] + (i // 3)
             for _ in range(tank_count):
                 wave_enemies.append(("Tank", tank_health, tank_speed, tank_reward))
 
-        waves.append(wave_enemies)
+        # Armored enemies (start from wave 3)
+        if i >= 3:
+            armored_count  = 1 + (i // 3)
+            armored_health = ENEMY_TYPE_STATS["Armored"]["health"] + i * 5
+            armored_speed  = ENEMY_TYPE_STATS["Armored"]["speed"] + (i // 6)
+            armored_reward = ENEMY_TYPE_STATS["Armored"]["reward"] + (i // 3)
+            for _ in range(armored_count):
+                wave_enemies.append(("Armored", armored_health, armored_speed, armored_reward))
 
-    return waves
+        # Flying enemies (start from wave 4)
+        if i >= 4:
+            flying_count  = 1 + (i // 4)
+            flying_health = ENEMY_TYPE_STATS["Flying"]["health"] + i * 2
+            flying_speed  = ENEMY_TYPE_STATS["Flying"]["speed"] + (i // 6)
+            flying_reward = ENEMY_TYPE_STATS["Flying"]["reward"] + (i // 3)
+            for _ in range(flying_count):
+                wave_enemies.append(("Flying", flying_health, flying_speed, flying_reward))
+
+        all_waves.append(wave_enemies)
+
+    return all_waves
 
 
+# ---------------------------------------------------------------------
+#  Core Wave Execution
+# ---------------------------------------------------------------------
 def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
-    """Simulate the wave until all enemies are dead or reach the end."""
+    """Simulate the wave. Also track how many of each type made it through."""
     enemies = [Enemy(e[0], e[1], e[2], e[3]) for e in wave_enemies]
+
+    # Track how many of each type leak through
+    leaks_this_wave: Dict[str, int] = {}
 
     wave_ongoing = True
     while wave_ongoing:
@@ -169,18 +260,20 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
             enemy.path_position += enemy.speed
             if enemy.path_position >= len(state.path):
                 state.health -= 1
+                # Count this leak
+                leaks_this_wave[enemy.enemy_type] = leaks_this_wave.get(enemy.enemy_type, 0) + 1
                 enemy.health = 0  # mark as "dead"
 
         # Towers shoot
         for _, tower in state.towers.items():
             for enemy in enemies:
-                if enemy.health > 0:
-                    # Manhattan distance
-                    if enemy.path_position < len(state.path):
-                        ex, ey = state.path[enemy.path_position]
-                        dist = abs(tower.x - ex) + abs(tower.y - ey)
-                        if dist <= tower.range_:
-                            enemy.health -= tower.damage
+                if enemy.health > 0 and enemy.path_position < len(state.path):
+                    dist = abs(tower.x - state.path[enemy.path_position][0]) + \
+                           abs(tower.y - state.path[enemy.path_position][1])
+                    if dist <= tower.range_:
+                        # Tower damage depends on enemy type
+                        damage = tower.get_damage_against(enemy.enemy_type)
+                        enemy.health -= damage
         
         # Remove dead enemies, add rewards
         alive = []
@@ -188,15 +281,19 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
             if enemy.health > 0:
                 alive.append(enemy)
             else:
-                state.gold += enemy.reward
+                # If not counted as leak, we get a reward
+                if enemy.path_position < len(state.path):
+                    state.gold += enemy.reward
         enemies = alive
 
-        # Check conditions
         if state.health <= 0:
             print("Player health reached 0. Game Over!")
             break
         if not enemies:
             wave_ongoing = False
+
+    # Store the leak data in the state so the LLM can see it next wave
+    state.last_wave_leaks = leaks_this_wave
 
 
 def get_valid_build_positions(state: GameState) -> List[Tuple[int, int]]:
@@ -217,13 +314,19 @@ def get_valid_build_positions(state: GameState) -> List[Tuple[int, int]]:
     return valid_positions
 
 # ---------------------------------------------------------------------
-#  LLM Decision (OLD style usage)
+#  LLM Decision (keeping older style usage)
 # ---------------------------------------------------------------------
-def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]], model_name: str) -> str:
+def get_llm_decision(state: GameState,
+                     next_wave: List[Tuple[str, int, int, int]],
+                     model_name: str) -> str:
     """
     Calls the OpenAI Chat API to decide:
-       DO_NOTHING | BUILD | UPGRADE
-    with the older openai.chat.completions.create usage.
+       - DO_NOTHING
+       - BUILD tower (Cannon/Archer/Laser) at [row,col]
+       - UPGRADE tower_id
+    We provide the full state, including:
+      - last wave leaks by enemy type
+      - multiple tower types
     """
     logging.info("[get_llm_decision] init")
     
@@ -238,28 +341,27 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
         "\nDo not include extra keys or commentary."
     )
 
-    # Summarize the wave
+    # Summarize next wave
     enemy_summary = {}
     for (etype, ehealth, espeed, ereward) in next_wave:
         enemy_summary[etype] = enemy_summary.get(etype, 0) + 1
 
     # Tower info
-    towers_info = [
-        {
+    towers_info = []
+    for t in state.towers.values():
+        towers_info.append({
             "tower_id": t.tower_id,
             "type": t.tower_type,
             "level": t.level,
             "range": t.range_,
-            "damage": t.damage,
+            "base_damage": t.base_damage,
             "position": [t.x, t.y]
-        }
-        for t in state.towers.values()
-    ]
+        })
 
     # Buildable positions
     valid_positions = get_valid_build_positions(state)
 
-    # Map layout
+    # Map layout as strings
     rows = len(state.map_layout)
     cols = len(state.map_layout[0])
     textual_map = [
@@ -267,22 +369,37 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
         for r in range(rows)
     ]
 
+    # If we had leaks from last wave, show them
+    leak_info = state.last_wave_leaks if state.last_wave_leaks else {}
+
+    # Also let the LLM know about available tower types (with cost, range, base_damage)
+    tower_type_options = {}
+    for ttype, data in TOWER_TYPES.items():
+        tower_type_options[ttype] = {
+            "cost": data["cost"],
+            "range": data["range"],
+            "base_damage": data["base_damage"]
+        }
+
     user_prompt = (
         f"Current wave number: {state.wave_number}\n"
         f"Health: {state.health}\n"
         f"Gold: {state.gold}\n"
-        f"Towers: {towers_info}\n"
+        f"Towers: {towers_info}\n\n"
+        f"Available tower types (cost, range, base_damage): {tower_type_options}\n\n"
+        f"Enemies that leaked last wave: {leak_info}\n"
+        f"(These are the counts of each enemy type that made it through.)\n\n"
         f"Upcoming wave enemy counts: {enemy_summary}\n\n"
-        f"Map layout (each string is a row):\n{textual_map}\n\n"
+        f"Map layout rows (P=path, .=empty, X=blocked):\n{textual_map}\n\n"
         f"Valid build positions (row,col): {valid_positions}\n\n"
         "Decide ONE action:\n"
         "- DO_NOTHING\n"
-        "- BUILD <tower_type> at [row,col] (must be in valid build positions)\n"
+        "- BUILD <tower_type> at [row,col]\n"
         "- UPGRADE <tower_id>\n\n"
         "Return your decision ONLY as valid JSON."
     )
 
-    # Pause to reduce rate-limit issues
+    # Pause to avoid rate-limit issues
     time.sleep(1)
     
     try:
@@ -301,13 +418,14 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
     
     return llm_output
 
+
 def parse_llm_action(state: GameState, llm_raw_json: str):
     """
     Parses the LLM's JSON response for the action.
-    One of:
-        {"action": "DO_NOTHING"}
-        {"action": "BUILD", "tower_type": "Cannon", "position": [3,2]}
-        {"action": "UPGRADE", "tower_id": 2}
+    Expecting:
+      - {"action": "DO_NOTHING"}
+      - {"action": "BUILD", "tower_type": "Cannon", "position": [3,2]}
+      - {"action": "UPGRADE", "tower_id": 2}
     """
     try:
         data = json.loads(llm_raw_json)
@@ -324,22 +442,22 @@ def parse_llm_action(state: GameState, llm_raw_json: str):
     elif action == "BUILD":
         tower_type = data.get("tower_type", "Cannon")
         pos = data.get("position", [0, 0])
+        if (tower_type not in TOWER_TYPES):
+            print(f"LLM tried BUILD with unknown tower type '{tower_type}'. Ignoring.")
+            return
         if len(pos) == 2:
             bx, by = pos
-            if is_buildable(state, bx, by) and state.gold >= 100:
+            tower_cost = TOWER_TYPES[tower_type]["cost"]
+            if is_buildable(state, bx, by) and state.gold >= tower_cost:
                 new_tower = Tower(
                     tower_id=state.next_tower_id,
                     x=bx,
                     y=by,
-                    tower_type=tower_type,
-                    level=1,
-                    range_=2,
-                    damage=10,
-                    cost=100
+                    tower_type=tower_type
                 )
                 state.towers[state.next_tower_id] = new_tower
                 state.next_tower_id += 1
-                state.gold -= 100
+                state.gold -= tower_cost
                 print(f"Built a {tower_type} tower at {pos}. Gold left: {state.gold}")
             else:
                 print("LLM tried BUILD, but invalid position or insufficient gold.")
@@ -348,17 +466,19 @@ def parse_llm_action(state: GameState, llm_raw_json: str):
     
     elif action == "UPGRADE":
         tower_id = data.get("tower_id")
-        if not tower_id or tower_id not in state.towers:
+        if not tower_id or (tower_id not in state.towers):
             print("LLM tried UPGRADE with invalid tower_id.")
             return
+        # Let's say each upgrade costs 50 gold:
         upgrade_cost = 50
         if state.gold >= upgrade_cost:
             t = state.towers[tower_id]
             t.upgrade()
             state.gold -= upgrade_cost
-            print(f"Upgraded Tower #{tower_id} to level {t.level}. Gold left: {state.gold}")
+            print(f"Upgraded Tower #{tower_id} (Type: {t.tower_type}) to Level {t.level}. Gold left: {state.gold}")
         else:
             print("LLM chose UPGRADE, but insufficient gold.")
+
 
 def is_buildable(state: GameState, x: int, y: int) -> bool:
     """Check if (x,y) is within bounds, '.' on the map, and no tower there."""
@@ -373,6 +493,7 @@ def is_buildable(state: GameState, x: int, y: int) -> bool:
             return False
     return True
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="gpt-3.5-turbo", 
@@ -384,15 +505,19 @@ def main():
     model_name = args.model
     num_waves = args.waves
 
+    # Initialize game state
     state = GameState()
-    # Generate waves with a steeper difficulty curve:
-    state.waves = generate_waves(num_waves)
+
+    # Create wave definitions (steeper difficulty)
+    wave_data = generate_waves(num_waves)
+    state.waves = wave_data
 
     logging.info(f"Starting Tower Defense Test for {num_waves} wave(s). Model={model_name}")
     
     print(f"Starting Tower Defense Benchmark ({num_waves} Wave(s))!")
     state.print_map()
 
+    # Run waves
     while state.wave_number < len(state.waves) and state.health > 0:
         state.wave_number += 1
         current_wave = state.waves[state.wave_number - 1]
