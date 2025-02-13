@@ -375,7 +375,15 @@ def get_llm_decision(state: GameState,
     # Summarize next wave
     enemy_summary = {}
     for (etype, ehealth, espeed, ereward) in next_wave:
-        enemy_summary[etype] = enemy_summary.get(etype, 0) + 1
+        if etype not in enemy_summary:
+            enemy_summary[etype] = {
+                'count': 1,
+                'health': ehealth,
+                'speed': espeed,
+                'reward': ereward
+            }
+        else:
+            enemy_summary[etype]['count'] += 1
 
     # Tower info
     towers_info = []
@@ -412,29 +420,24 @@ def get_llm_decision(state: GameState,
             "upgrade_cost": data["upgrade_cost"],
             "range": data["range"],
             "base_damage": data["base_damage"],
+            "damage_modifiers": data["damage_mods"],
             "upgrade_effects": {
-                "damage": "+3 base damage per level",
-                "range": "+1 range every odd level (levels 3, 5, 7, etc.)",
-                "cost_scaling": f"Upgrade cost starts at {data['upgrade_cost']} and increases by 25 gold per level"
+                "damage": "+3 damage/level",
+                "range": "+1 range every odd level",
+                "cost": "Base: {upgrade_cost} + 25*(level-1)"
             }
         }
 
     user_prompt = (
-        f"Current wave number: {state.wave_number}\n"
-        f"Health: {state.health}\n"
-        f"Gold: {state.gold}\n"
-        f"Towers: {towers_info}\n\n"
-        f"Available tower types (cost, range, base_damage): {tower_type_options}\n\n"
-        f"Enemies that leaked last wave: {leak_info}\n"
-        f"(These are the counts of each enemy type that made it through.)\n\n"
-        f"Upcoming wave enemy counts: {enemy_summary}\n\n"
-        f"Map layout rows (P=path, .=empty, X=blocked):\n{textual_map}\n\n"
-        f"Valid build positions (row,col): {valid_positions}\n\n"
-        "Decide ONE action:\n"
-        "- DO_NOTHING\n"
-        "- BUILD <tower_type> at [row,col]\n"
-        "- UPGRADE <tower_id>\n\n"
-        "Return your decision ONLY as valid JSON."
+        f"=== Current Status ===\n"
+        f"Wave: {state.wave_number} | Health: {state.health} | Gold: {state.gold}\n\n"
+        f"=== Existing Towers ===\n{json.dumps(towers_info, indent=2)}\n\n"
+        f"=== Available Towers ===\n{json.dumps(tower_type_options, indent=2)}\n\n"
+        f"=== Last Wave Leaks ===\n{leak_info}\n\n"
+        f"=== Upcoming Wave ===\n{json.dumps(enemy_summary, indent=2)}\n\n"
+        f"=== Map ===\n" + "\n".join(textual_map) + 
+        f"\n\nValid Build Positions: {valid_positions}\n"
+        "Return action as JSON:"
     )
 
     logging.info(f"System Prompt:\n{system_prompt}\n")
