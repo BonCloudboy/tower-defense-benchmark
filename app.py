@@ -1,5 +1,6 @@
 import random
 from typing import List, Tuple, Dict
+import openai
 
 # -----------------------------
 # 1. Game State Definitions
@@ -129,83 +130,193 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
 # 3. Interacting with the LLM
 # -----------------------------
 
-def get_llm_decision(state: GameState) -> str:
-    """
-    Here, you'd make a single call to the LLM, providing a concise summary:
-    - wave_number
-    - gold
-    - health
-    - existing towers (positions, levels, etc.)
-    - upcoming wave info (enemy types, counts, etc.)
-    
-    For the sake of example, we'll just return a random action or a do-nothing action.
-    """
-    
-    # In a real setup, you'd do something like:
-    # prompt = create_prompt(state)
-    # action = call_llm_api(prompt)
-    # return action
-    
-    # For demonstration, let's randomly decide:
-    possible_actions = ["DO_NOTHING", "BUILD", "UPGRADE"]
-    chosen = random.choice(possible_actions)
-    return chosen
+import json
+import logging
 
-def parse_llm_action(state: GameState, action: str):
+def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]]) -> str:
     """
-    Interpret the LLM's response. For example, if LLM says:
-    "BUILD Cannon (3,2)" -> we parse tower type "Cannon", position (3,2), cost check, etc.
-    "UPGRADE Tower 1" -> find Tower #1 and upgrade it if gold is sufficient.
-    "DO_NOTHING" -> skip.
+    Calls the OpenAI Chat API to decide whether to BUILD, UPGRADE, or DO_NOTHING,
+    based on the current GameState and the next wave's enemy composition.
     
-    For the sake of the example, we will do a simplified version:
-    - If "BUILD", pick a random buildable spot and build a tower.
-    - If "UPGRADE", pick a random existing tower and upgrade.
+    Expects the LLM to return a JSON object in one of these forms:
+    
+    {
+      "action": "DO_NOTHING"
+    }
+    or
+    {
+      "action": "BUILD",
+      "tower_type": "<some tower type>",
+      "position": [row, col]
+    }
+    or
+    {
+      "action": "UPGRADE",
+      "tower_id": <tower_id_integer>
+    }
     """
+    
+    logging.info("[get_llm_decision] init")
+    
+    # --- 1. Build the system message (instructions for the assistant) ---
+    system_prompt = (
+        "You are a Tower Defense decision-making AI. "
+        "You receive the current game state and must decide ONE of three actions each wave: "
+        "BUILD a new tower, UPGRADE an existing tower, or DO_NOTHING. "
+        "Your response MUST be valid JSON with the structure described. "
+        "Do not include any extra keys or commentary."
+    )
+    
+    # --- 2. Summarize the relevant state for the LLM ---
+    # Here, we provide the next wave info, the player's gold, health, tower info, etc.
+    
+    # Convert wave enemy data into a short summary (e.g. count how many of each type)
+    enemy_summary = {}
+    for e_type, e_health, e_speed, e_reward in next_wave:
+        enemy_summary[e_type] = enemy_summary.get(e_type, 0) + 1
+    
+    towers_info = [
+        {
+            "tower_id": t.tower_id,
+            "type": t.tower_type,
+            "level": t.level,
+            "range": t.range_,
+            "damage": t.damage,
+            "position": [t.x, t.y]
+        }
+        for t in state.towers.values()
+    ]
+    
+    user_prompt = (
+        f"Current wave number: {state.wave_number}\n"
+        f"Health: {state.health}\n"
+        f"Gold: {state.gold}\n"
+        f"Towers: {towers_info}\n"
+        f"Upcoming wave enemy counts: {enemy_summary}\n\n"
+        "Decide ONE action:\n"
+        "- DO_NOTHING\n"
+        "- BUILD <tower_type> at [row,col]\n"
+        "- UPGRADE <tower_id>\n\n"
+        "Response format must be strictly JSON, with one of these forms:\n\n"
+        "{{\"action\": \"DO_NOTHING\"}}\n\n"
+        "{{\"action\": \"BUILD\", \"tower_type\": \"Cannon\", \"position\": [3,2]}}\n\n"
+        "{{\"action\": \"UPGRADE\", \"tower_id\": 2}}\n"
+    )
+    
+    # --- 3. Call the OpenAI Chat API ---
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",  # or whichever model is suitable
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        llm_output = response.choices[0].message.content.strip()
+        logging.info(f"[get_llm_decision] Raw LLM output: {llm_output}")
+        
+    except Exception as e:
+        logging.error(f"Error calling OpenAI API: {e}")
+        # Fallback: do nothing if there's an API error
+        return "DO_NOTHING"
+    
+    # --- 4. Parse the LLM's JSON response ---
+    try:
+        data = json.loads(llm_output)
+        action = data.get("action", "DO_NOTHING")
+        
+        # Validate the action field
+        if action not in ["DO_NOTHING", "BUILD", "UPGRADE"]:
+            logging.warning(f"LLM returned unrecognized action: {action}. Defaulting to DO_NOTHING.")
+            return "DO_NOTHING"
+        
+        # Return the entire JSON string so we can handle it outside
+        # or just return the `data` dict. We'll return it as a string
+        # so parse_llm_action can interpret it.
+        return llm_output
+    
+    except json.JSONDecodeError as decode_err:
+        logging.error(f"Failed to decode LLM JSON response: {decode_err}")
+        # If JSON is invalid, we default to doing nothing.
+        return "DO_NOTHING"
+
+
+def parse_llm_action(state: GameState, llm_raw_json: str):
+    """
+    Interpret the JSON output from the LLM, which might look like:
+      {"action": "DO_NOTHING"}
+      {"action": "BUILD", "tower_type": "Cannon", "position": [3,2]}
+      {"action": "UPGRADE", "tower_id": 2}
+    """
+    try:
+        data = json.loads(llm_raw_json)
+    except json.JSONDecodeError:
+        # If there's a parsing error, do nothing
+        print("Failed to parse LLM JSON. Doing nothing.")
+        return
+    
+    action = data.get("action", "DO_NOTHING")
     
     if action == "DO_NOTHING":
+        print("LLM chose DO_NOTHING.")
         return
     
     elif action == "BUILD":
-        # find a random buildable spot
-        buildable_spots = []
-        for i in range(len(state.map_layout)):
-            for j in range(len(state.map_layout[0])):
-                if state.map_layout[i][j] == '.':  # buildable
-                    # also check we don't already have a tower here
-                    if not any(tower.x == i and tower.y == j for tower in state.towers.values()):
-                        buildable_spots.append((i, j))
-        
-        if buildable_spots and state.gold >= 100:
-            bx, by = random.choice(buildable_spots)
-            new_tower = Tower(
-                tower_id=state.next_tower_id,
-                x=bx,
-                y=by,
-                tower_type="Cannon",
-                level=1,
-                range_=2,
-                damage=10,
-                cost=100
-            )
-            state.towers[state.next_tower_id] = new_tower
-            state.next_tower_id += 1
-            state.gold -= 100
-            print(f"Built a tower at {(bx,by)}. Gold left: {state.gold}")
+        tower_type = data.get("tower_type", "Cannon")
+        position = data.get("position", [0, 0])  # default fallback
+        if len(position) == 2:
+            bx, by = position
+            # Check gold and if buildable, etc.
+            # We can re-use the earlier logic or refine it
+            if state.gold >= 100 and is_buildable(state, bx, by):
+                new_tower = Tower(
+                    tower_id=state.next_tower_id,
+                    x=bx,
+                    y=by,
+                    tower_type=tower_type,  # use the LLM-provided type or "Cannon" by default
+                    level=1,
+                    range_=2,
+                    damage=10,
+                    cost=100
+                )
+                state.towers[state.next_tower_id] = new_tower
+                state.next_tower_id += 1
+                state.gold -= 100
+                print(f"Built a {tower_type} tower at {(bx,by)}. Gold left: {state.gold}")
+            else:
+                print("LLM chose BUILD, but not feasible (insufficient gold or invalid position).")
         else:
-            print("LLM chose BUILD, but no available spots or insufficient gold.")
+            print("LLM provided invalid build position. Doing nothing.")
     
     elif action == "UPGRADE":
-        if state.towers:
-            tower_id_to_upgrade = random.choice(list(state.towers.keys()))
-            tower_to_upgrade = state.towers[tower_id_to_upgrade]
-            upgrade_cost = 50  # simplified
-            if state.gold >= upgrade_cost:
-                tower_to_upgrade.upgrade()
-                state.gold -= upgrade_cost
-                print(f"Upgraded Tower #{tower_id_to_upgrade} to level {tower_to_upgrade.level}. Gold left: {state.gold}")
-            else:
-                print("LLM chose UPGRADE, but insufficient gold.")
+        tower_id = data.get("tower_id")
+        if not tower_id or tower_id not in state.towers:
+            print("LLM chose UPGRADE, but provided invalid tower_id.")
+            return
+        tower_to_upgrade = state.towers[tower_id]
+        upgrade_cost = 50  # simplified
+        if state.gold >= upgrade_cost:
+            tower_to_upgrade.upgrade()
+            state.gold -= upgrade_cost
+            print(f"Upgraded Tower #{tower_id} to level {tower_to_upgrade.level}. Gold left: {state.gold}")
+        else:
+            print("LLM chose UPGRADE, but insufficient gold.")
+
+def is_buildable(state: GameState, x: int, y: int) -> bool:
+    """
+    Returns True if (x,y) is within bounds, not a path, not blocked,
+    and doesn't already have a tower.
+    """
+    if not (0 <= x < len(state.map_layout) and 0 <= y < len(state.map_layout[0])):
+        return False
+    if state.map_layout[x][y] != '.':  # Must be buildable spot
+        return False
+    # Check no existing tower
+    for t in state.towers.values():
+        if t.x == x and t.y == y:
+            return False
+    return True
 
 
 # -----------------------------
@@ -214,7 +325,6 @@ def parse_llm_action(state: GameState, action: str):
 
 def main():
     state = GameState()
-    
     print("Starting Tower Defense Benchmark!")
     state.print_map()
     
@@ -224,15 +334,13 @@ def main():
         
         # -- Build/Upgrade Phase (LLM Action) --
         print(f"\n== Wave #{state.wave_number} (Preparation) ==")
-        llm_action = get_llm_decision(state)
-        print(f"LLM decided: {llm_action}")
-        parse_llm_action(state, llm_action)
+        llm_json_response = get_llm_decision(state, current_wave)
+        parse_llm_action(state, llm_json_response)
         
         # -- Wave Simulation --
         print(f"\n== Wave #{state.wave_number} (Combat) ==")
         run_wave(state, current_wave)
         
-        # If health <= 0, game over
         if state.health <= 0:
             break
     
@@ -240,6 +348,7 @@ def main():
         print(f"All waves cleared! Final health: {state.health}, Final gold: {state.gold}")
     else:
         print(f"You survived until wave {state.wave_number}, but then lost.")
+
 
 if __name__ == "__main__":
     main()
