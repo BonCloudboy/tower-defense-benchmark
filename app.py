@@ -181,6 +181,20 @@ class GameState:
             print(" ".join(row))
         print()
 
+def print_and_log_map(state: GameState):
+    """Print and log the current map state."""
+    map_copy = [row[:] for row in state.map_layout]
+    for _, tower in state.towers.items():
+        map_copy[tower.x][tower.y] = 'T'
+    
+    map_str = "\nMap Layout (P=Path, .=Empty, X=Blocked, T=Tower):\n"
+    for row in map_copy:
+        row_str = " ".join(row)
+        map_str += row_str + "\n"
+    
+    print(map_str)
+    logging.info(map_str)
+
 # ---------------------------------------------------------------------
 #  Steep Wave Generation Example
 # ---------------------------------------------------------------------
@@ -248,7 +262,13 @@ def generate_waves(num_waves: int) -> List[List[Tuple[str, int, int, int]]]:
 # ---------------------------------------------------------------------
 def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
     """Simulate the wave. Also track how many of each type made it through."""
+    logging.info(f"\n{'='*50}\n[Wave {state.wave_number}] Combat Phase\n{'='*50}")
+
     enemies = [Enemy(e[0], e[1], e[2], e[3]) for e in wave_enemies]
+
+    initial_enemy_count = len(enemies)
+    logging.info(f"Wave {state.wave_number} starting with {initial_enemy_count} enemies")
+    logging.info(f"Player state - Health: {state.health}, Gold: {state.gold}")
 
     # Track how many of each type leak through
     leaks_this_wave: Dict[str, int] = {}
@@ -292,6 +312,13 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
         if not enemies:
             wave_ongoing = False
 
+    logging.info(f"Wave {state.wave_number} completed")
+    logging.info(f"Enemies that leaked through: {leaks_this_wave}")
+    logging.info(f"Final state - Health: {state.health}, Gold: {state.gold}")
+    
+    # Log the map state after the wave
+    print_and_log_map(state)
+
     # Store the leak data in the state so the LLM can see it next wave
     state.last_wave_leaks = leaks_this_wave
 
@@ -328,7 +355,7 @@ def get_llm_decision(state: GameState,
       - last wave leaks by enemy type
       - multiple tower types
     """
-    logging.info("[get_llm_decision] init")
+    logging.info(f"\n{'='*50}\n[Wave {state.wave_number}] LLM Decision Request\n{'='*50}")
     
     system_prompt = (
         "You are a Tower Defense decision-making AI. "
@@ -399,6 +426,9 @@ def get_llm_decision(state: GameState,
         "Return your decision ONLY as valid JSON."
     )
 
+    logging.info(f"System Prompt:\n{system_prompt}\n")
+    logging.info(f"User Prompt:\n{user_prompt}\n")
+
     # Pause to avoid rate-limit issues
     time.sleep(1)
     
@@ -411,7 +441,8 @@ def get_llm_decision(state: GameState,
             ]
         )
         llm_output = response.choices[0].message.content.strip()
-        logging.info(f"[get_llm_decision] Raw LLM output: {llm_output}")
+        logging.info(f"Parsed LLM Output:\n{llm_output}\n")
+
     except Exception as e:
         logging.error(f"Error calling OpenAI API: {e}")
         llm_output = '{"action": "DO_NOTHING"}'
@@ -512,7 +543,8 @@ def main():
     wave_data = generate_waves(num_waves)
     state.waves = wave_data
 
-    logging.info(f"Starting Tower Defense Test for {num_waves} wave(s). Model={model_name}")
+    logging.info(f"\n{'='*50}\nStarting Tower Defense Test\n{'='*50}")
+    logging.info(f"Configuration - Waves: {num_waves}, Model: {model_name}")
     
     print(f"Starting Tower Defense Benchmark ({num_waves} Wave(s))!")
     state.print_map()
@@ -533,7 +565,9 @@ def main():
         
         if state.health <= 0:
             break
-    
+
+    logging.info(f"\n{'='*50}\nGame Complete\n{'='*50}")
+
     if state.health > 0:
         print(f"All waves cleared! Final Health: {state.health}, Final Gold: {state.gold}")
         logging.info(f"All waves cleared! Health={state.health}, Gold={state.gold}")
