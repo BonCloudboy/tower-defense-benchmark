@@ -175,23 +175,26 @@ class GameState:
         self.last_wave_leaks: Dict[str, int] = {}
 
     def print_map(self):
-        """Simple console print to see towers / layout."""
+        """Console print with tower type identifiers"""
         map_copy = [row[:] for row in self.map_layout]
         for _, tower in self.towers.items():
-            map_copy[tower.x][tower.y] = 'T'
+            type_char = tower.tower_type[0].upper()
+            map_copy[tower.x][tower.y] = type_char
         
-        print("Map Layout (P=Path, .=Empty, X=Blocked, T=Tower):")
+        print("Map Layout (P=Path, .=Empty, X=Blocked, C=Cannon, A=Archer, L=Laser):")
         for row in map_copy:
             print(" ".join(row))
         print()
 
 def print_and_log_map(state: GameState):
-    """Print and log the current map state."""
+    """Print and log the current map state with tower type identifiers"""
     map_copy = [row[:] for row in state.map_layout]
     for _, tower in state.towers.items():
-        map_copy[tower.x][tower.y] = 'T'
+        # Use first letter of tower type as identifier
+        type_char = tower.tower_type[0].upper()
+        map_copy[tower.x][tower.y] = type_char
     
-    map_str = "\nMap Layout (P=Path, .=Empty, X=Blocked, T=Tower):\n"
+    map_str = "\nMap Layout (P=Path, .=Empty, X=Blocked, C=Cannon, A=Archer, L=Laser):\n"
     for row in map_copy:
         row_str = " ".join(row)
         map_str += row_str + "\n"
