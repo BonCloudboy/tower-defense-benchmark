@@ -3,6 +3,7 @@ import openai
 import time
 import json
 import logging
+import argparse
 from datetime import datetime
 from typing import List, Tuple, Dict
 
@@ -22,6 +23,7 @@ logging.basicConfig(
 
 # ---------------------------------------------------------------------
 #  OpenAI Setup (Make sure your ENV vars are set)
+#  NOTE: We keep the old "openai.chat.completions.create" usage as requested.
 # ---------------------------------------------------------------------
 openai_api_key = os.getenv('OPENAI_API_KEY')
 openai_org = os.getenv('OPENAI_ORG')
@@ -30,7 +32,7 @@ openai.organization = openai_org
 openai.api_key = openai_api_key
 
 # ---------------------------------------------------------------------
-#  Game Classes and Functions
+#  Game Classes
 # ---------------------------------------------------------------------
 class Tower:
     def __init__(
@@ -94,11 +96,8 @@ class GameState:
         self.health = 20
         self.wave_number = 0
         
-        # Only 2 waves for this test
-        self.waves = [
-            [("Basic", 10, 1, 5) for _ in range(3)],  # wave 1
-            [("Basic", 10, 1, 5) for _ in range(2)] + [("Fast", 8, 2, 5) for _ in range(2)],  # wave 2
-        ]
+        # We will dynamically assign self.waves outside __init__ with generate_waves()
+        self.waves = []
 
     def print_map(self):
         """Simple console print to see towers / layout."""
@@ -111,7 +110,43 @@ class GameState:
             print(" ".join(row))
         print()
 
+# ---------------------------------------------------------------------
+#  Wave Generation
+# ---------------------------------------------------------------------
+def generate_waves(num_waves: int) -> List[List[Tuple[str, int, int, int]]]:
+    """
+    Dynamically generate a list of waves, each wave being a list of enemy tuples:
+        (enemy_type, health, speed, reward)
 
+    For example, each wave i might have:
+    - i+2 Basic enemies (health grows slightly per wave)
+    - 1 Fast enemy after wave #2, etc.
+    """
+    waves = []
+    for i in range(num_waves):
+        # wave i (0-based index) => wave # = i+1
+        wave_enemies = []
+        # Add Basic enemies with gradually increasing health/speed
+        basic_count = i + 2  # e.g. wave 1 => 2, wave 2 => 3, wave 3 => 4...
+        for _ in range(basic_count):
+            # health grows slightly each wave, speed slowly increases
+            health = 10 + 2 * i
+            speed = 1 + (i // 3)  # Every 3 waves, speed increases by 1
+            wave_enemies.append(("Basic", health, speed, 5))
+
+        # Add a "Fast" enemy after wave #1
+        if i >= 1:
+            # A bit less health, but higher speed
+            wave_enemies.append(("Fast", 8 + i, 2 + (i // 3), 6))
+
+        waves.append(wave_enemies)
+
+    return waves
+
+
+# ---------------------------------------------------------------------
+#  Core Wave Execution
+# ---------------------------------------------------------------------
 def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
     """Simulate the wave until all enemies are dead or reach the end."""
     enemies = [Enemy(e[0], e[1], e[2], e[3]) for e in wave_enemies]
@@ -153,6 +188,9 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
             wave_ongoing = False
 
 
+# ---------------------------------------------------------------------
+#  Helper to get valid build positions
+# ---------------------------------------------------------------------
 def get_valid_build_positions(state: GameState) -> List[Tuple[int, int]]:
     """
     Return a list of (row, col) coordinates where the map cell is '.' 
@@ -170,17 +208,18 @@ def get_valid_build_positions(state: GameState) -> List[Tuple[int, int]]:
                     valid_positions.append((r, c))
     return valid_positions
 
-
 # ---------------------------------------------------------------------
 #  LLM Decision
 # ---------------------------------------------------------------------
-def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]]) -> str:
+def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]], model_name: str) -> str:
     """
     Calls the OpenAI Chat API to decide whether to:
      - BUILD
      - UPGRADE
      - DO_NOTHING
     Returns a JSON string that will be parsed by parse_llm_action.
+
+    We explicitly keep the older 'openai.chat.completions.create' usage.
     """
     logging.info("[get_llm_decision] init")
     
@@ -216,8 +255,7 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
     # Buildable positions
     valid_positions = get_valid_build_positions(state)
 
-    # Provide a textual map layout (row by row), so the LLM sees what's blocked/path.
-    # Also providing the valid build positions as an explicit list.
+    # Provide a textual map layout (row by row)
     rows = len(state.map_layout)
     cols = len(state.map_layout[0])
     textual_map = [
@@ -231,8 +269,7 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
         f"Gold: {state.gold}\n"
         f"Towers: {towers_info}\n"
         f"Upcoming wave enemy counts: {enemy_summary}\n\n"
-        f"Map layout (each string is a row, with 'P' for path, '.' for empty, 'X' for blocked):\n"
-        f"{textual_map}\n\n"
+        f"Map layout (each string is a row):\n{textual_map}\n\n"
         f"Valid build positions (row,col): {valid_positions}\n\n"
         "Decide ONE action:\n"
         "- DO_NOTHING\n"
@@ -241,12 +278,13 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
         "Return your decision ONLY as valid JSON."
     )
 
-    # A short pause to reduce rate-limit issues.
+    # A short pause to reduce rate-limit issues
     time.sleep(1)
     
     try:
+        # Keep the old usage:
         response = openai.chat.completions.create(
-            model="gpt-4o", 
+            model=model_name,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -337,20 +375,36 @@ def is_buildable(state: GameState, x: int, y: int) -> bool:
 
 
 def main():
-    # Create the game and log some info
+    # ---------------------------------------------------------------------
+    #  Command-line arguments
+    # ---------------------------------------------------------------------
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="gpt-3.5-turbo", 
+                        help="Which OpenAI model to use (e.g. gpt-3.5-turbo, gpt-4, etc.)")
+    parser.add_argument("--waves", type=int, default=2,
+                        help="Number of waves to run.")
+    args = parser.parse_args()
+
+    model_name = args.model
+    num_waves = args.waves
+
+    # Create the game and generate waves
     state = GameState()
-    logging.info("Starting Tower Defense Test for 2 waves.")
+    state.waves = generate_waves(num_waves)
+
+    logging.info(f"Starting Tower Defense Test for {num_waves} wave(s). Model={model_name}")
     
-    print("Starting Tower Defense Benchmark (2 Waves)!")
+    print(f"Starting Tower Defense Benchmark ({num_waves} Wave(s))!")
     state.print_map()
-    
+
+    # Main loop
     while state.wave_number < len(state.waves) and state.health > 0:
         state.wave_number += 1
         current_wave = state.waves[state.wave_number - 1]
         
         # -- Build/Upgrade Phase --
         print(f"== Wave #{state.wave_number} (Preparation) ==")
-        llm_json = get_llm_decision(state, current_wave)
+        llm_json = get_llm_decision(state, current_wave, model_name)
         parse_llm_action(state, llm_json)
         
         # -- Combat Phase --
@@ -367,6 +421,7 @@ def main():
     else:
         print(f"You survived until wave {state.wave_number}, but then lost. Health={state.health}")
         logging.info(f"Game Over at wave {state.wave_number}. Health={state.health}")
+
 
 if __name__ == "__main__":
     main()
