@@ -33,8 +33,17 @@ openai.api_key = openai_api_key
 #  Game Classes and Functions
 # ---------------------------------------------------------------------
 class Tower:
-    def __init__(self, tower_id: int, x: int, y: int, tower_type: str = "Cannon",
-                 level: int = 1, range_: int = 2, damage: int = 10, cost: int = 100):
+    def __init__(
+        self,
+        tower_id: int,
+        x: int,
+        y: int,
+        tower_type: str = "Cannon",
+        level: int = 1,
+        range_: int = 2,
+        damage: int = 10,
+        cost: int = 100
+    ):
         self.tower_id = tower_id
         self.x = x
         self.y = y
@@ -63,6 +72,7 @@ class Enemy:
 class GameState:
     def __init__(self):
         # Sample 5x5 map
+        # Using row-major indexing: map_layout[row][col]
         self.map_layout = [
             ['P','P','P','P','P'],
             ['.','.','.','.','P'],
@@ -71,9 +81,11 @@ class GameState:
             ['P','P','P','P','P'],
         ]
         # Path from top-left (0,0) to bottom-left (4,0) in a snake-like route:
-        self.path = [(0,0), (0,1), (0,2), (0,3), (0,4),
-                     (1,4), (2,4), (3,4), (4,4),
-                     (4,3), (4,2), (4,1), (4,0)]
+        self.path = [
+            (0,0), (0,1), (0,2), (0,3), (0,4),
+            (1,4), (2,4), (3,4), (4,4),
+            (4,3), (4,2), (4,1), (4,0)
+        ]
         
         self.towers: Dict[int, Tower] = {}
         self.next_tower_id = 1
@@ -82,7 +94,7 @@ class GameState:
         self.health = 20
         self.wave_number = 0
         
-        # Only 2 waves for this test:
+        # Only 2 waves for this test
         self.waves = [
             [("Basic", 10, 1, 5) for _ in range(3)],  # wave 1
             [("Basic", 10, 1, 5) for _ in range(2)] + [("Fast", 8, 2, 5) for _ in range(2)],  # wave 2
@@ -117,7 +129,7 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
         for _, tower in state.towers.items():
             for enemy in enemies:
                 if enemy.health > 0:
-                    # Check range
+                    # Check range (Manhattan distance)
                     if enemy.path_position < len(state.path):
                         ex, ey = state.path[enemy.path_position]
                         dist = abs(tower.x - ex) + abs(tower.y - ey)
@@ -141,6 +153,24 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
             wave_ongoing = False
 
 
+def get_valid_build_positions(state: GameState) -> List[Tuple[int, int]]:
+    """
+    Return a list of (row, col) coordinates where the map cell is '.' 
+    and there is no tower on that cell.
+    """
+    valid_positions = []
+    rows = len(state.map_layout)
+    cols = len(state.map_layout[0])
+
+    for r in range(rows):
+        for c in range(cols):
+            if state.map_layout[r][c] == '.':
+                # Ensure no existing tower occupies this cell
+                if not any(t.x == r and t.y == c for t in state.towers.values()):
+                    valid_positions.append((r, c))
+    return valid_positions
+
+
 # ---------------------------------------------------------------------
 #  LLM Decision
 # ---------------------------------------------------------------------
@@ -156,17 +186,21 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
     
     system_prompt = (
         "You are a Tower Defense decision-making AI. "
-        "Return only valid JSON with no code fences (no ```). "
-        "Your response MUST be valid JSON with the structure described. "
-        "Do not include any extra keys or commentary."
+        "Your goal is to make an optimal tower-building or upgrading decision. "
+        "Return only valid JSON (no markdown fences). "
+        "The JSON must match exactly one of these forms:\n\n"
+        "1) {\"action\": \"DO_NOTHING\"}\n"
+        "2) {\"action\": \"BUILD\", \"tower_type\": \"Cannon\", \"position\": [row,col]}\n"
+        "3) {\"action\": \"UPGRADE\", \"tower_id\": 2}\n"
+        "\nDo not include extra keys or commentary."
     )
 
-    
-    # Summarize the wave:
+    # Summarize the wave
     enemy_summary = {}
     for (etype, ehealth, espeed, ereward) in next_wave:
         enemy_summary[etype] = enemy_summary.get(etype, 0) + 1
-    
+
+    # Tower info to show the LLM
     towers_info = [
         {
             "tower_id": t.tower_id,
@@ -178,24 +212,36 @@ def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]
         }
         for t in state.towers.values()
     ]
-    
+
+    # Buildable positions
+    valid_positions = get_valid_build_positions(state)
+
+    # Provide a textual map layout (row by row), so the LLM sees what's blocked/path.
+    # Also providing the valid build positions as an explicit list.
+    rows = len(state.map_layout)
+    cols = len(state.map_layout[0])
+    textual_map = [
+        "".join(state.map_layout[r][c] for c in range(cols)) 
+        for r in range(rows)
+    ]
+
     user_prompt = (
         f"Current wave number: {state.wave_number}\n"
         f"Health: {state.health}\n"
         f"Gold: {state.gold}\n"
         f"Towers: {towers_info}\n"
         f"Upcoming wave enemy counts: {enemy_summary}\n\n"
+        f"Map layout (each string is a row, with 'P' for path, '.' for empty, 'X' for blocked):\n"
+        f"{textual_map}\n\n"
+        f"Valid build positions (row,col): {valid_positions}\n\n"
         "Decide ONE action:\n"
         "- DO_NOTHING\n"
-        "- BUILD <tower_type> at [row,col]\n"
+        "- BUILD <tower_type> at [row,col] (must be in valid build positions)\n"
         "- UPGRADE <tower_id>\n\n"
-        "Response format must be strictly JSON, with one of these forms:\n\n"
-        "{\"action\": \"DO_NOTHING\"}\n\n"
-        "{\"action\": \"BUILD\", \"tower_type\": \"Cannon\", \"position\": [3,2]}\n\n"
-        "{\"action\": \"UPGRADE\", \"tower_id\": 2}\n"
+        "Return your decision ONLY as valid JSON."
     )
-    
-    # Add a short wait to reduce rate-limit issues
+
+    # A short pause to reduce rate-limit issues.
     time.sleep(1)
     
     try:
@@ -278,7 +324,9 @@ def parse_llm_action(state: GameState, llm_raw_json: str):
 
 def is_buildable(state: GameState, x: int, y: int) -> bool:
     """Check if (x,y) is within bounds, is '.' (empty) on the map, and has no existing tower."""
-    if not (0 <= x < len(state.map_layout) and 0 <= y < len(state.map_layout[0])):
+    rows = len(state.map_layout)
+    cols = len(state.map_layout[0])
+    if not (0 <= x < rows and 0 <= y < cols):
         return False
     if state.map_layout[x][y] != '.':
         return False
@@ -301,7 +349,7 @@ def main():
         current_wave = state.waves[state.wave_number - 1]
         
         # -- Build/Upgrade Phase --
-        print(f"\n== Wave #{state.wave_number} (Preparation) ==")
+        print(f"== Wave #{state.wave_number} (Preparation) ==")
         llm_json = get_llm_decision(state, current_wave)
         parse_llm_action(state, llm_json)
         
@@ -312,6 +360,7 @@ def main():
         if state.health <= 0:
             break
     
+    # Final outcome
     if state.health > 0:
         print(f"All waves cleared! Final Health: {state.health}, Final Gold: {state.gold}")
         logging.info(f"All waves cleared! Health={state.health}, Gold={state.gold}")
