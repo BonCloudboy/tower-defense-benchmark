@@ -88,16 +88,18 @@ class GameState:
             [("Basic", 10, 1, 5) for _ in range(2)] + [("Fast", 8, 2, 5) for _ in range(2)],  # wave 2
         ]
 
-    def print_map(self):
-        """Simple console print to see towers / layout."""
+    def get_map_string(self) -> str:
+        """Return string representation of current map state."""
         map_copy = [row[:] for row in self.map_layout]
         for _, tower in self.towers.items():
-            map_copy[tower.x][tower.y] = 'T'
+            map_copy[tower.x][tower.y] = f'{tower.tower_type[0]}{tower.level}'  # e.g., 'C1' for level 1 Cannon
         
-        print("Map Layout (P=Path, .=Empty, X=Blocked, T=Tower):")
-        for row in map_copy:
-            print(" ".join(row))
-        print()
+        return "\nMap Layout (P=Path, .=Empty, X=Blocked, Cn=Cannon level n):\n" + \
+               "\n".join(" ".join(row) for row in map_copy) + "\n"
+
+    def print_map(self):
+        """Print current map state to console."""
+        print(self.get_map_string())
 
 
 def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
@@ -141,9 +143,6 @@ def run_wave(state: GameState, wave_enemies: List[Tuple[str, int, int, int]]):
             wave_ongoing = False
 
 
-# ---------------------------------------------------------------------
-#  LLM Decision
-# ---------------------------------------------------------------------
 def get_llm_decision(state: GameState, next_wave: List[Tuple[str, int, int, int]]) -> str:
     """
     Calls the OpenAI Chat API to decide whether to:
@@ -228,12 +227,14 @@ def parse_llm_action(state: GameState, llm_raw_json: str):
         data = json.loads(llm_raw_json)
     except json.JSONDecodeError:
         print("Failed to parse LLM JSON. Doing nothing.")
+        logging.error("Failed to parse LLM JSON")
         return
     
     action = data.get("action", "DO_NOTHING")
     
     if action == "DO_NOTHING":
         print("LLM chose DO_NOTHING.")
+        logging.info("LLM action: DO_NOTHING")
         return
     
     elif action == "BUILD":
@@ -256,15 +257,19 @@ def parse_llm_action(state: GameState, llm_raw_json: str):
                 state.next_tower_id += 1
                 state.gold -= 100
                 print(f"Built a {tower_type} tower at {pos}. Gold left: {state.gold}")
+                logging.info(f"LLM action: Built {tower_type} at {pos}. Gold: {state.gold}")
             else:
                 print("LLM tried BUILD, but invalid position or insufficient gold.")
+                logging.warning("LLM tried invalid BUILD")
         else:
             print("LLM gave invalid 'position' format. Doing nothing.")
+            logging.error("LLM gave invalid position format")
     
     elif action == "UPGRADE":
         tower_id = data.get("tower_id")
         if not tower_id or tower_id not in state.towers:
             print("LLM tried UPGRADE with invalid tower_id.")
+            logging.error(f"LLM tried to upgrade invalid tower_id: {tower_id}")
             return
         upgrade_cost = 50
         if state.gold >= upgrade_cost:
@@ -272,8 +277,10 @@ def parse_llm_action(state: GameState, llm_raw_json: str):
             t.upgrade()
             state.gold -= upgrade_cost
             print(f"Upgraded Tower #{tower_id} to level {t.level}. Gold left: {state.gold}")
+            logging.info(f"LLM action: Upgraded Tower #{tower_id} to level {t.level}. Gold: {state.gold}")
         else:
             print("LLM chose UPGRADE, but insufficient gold.")
+            logging.warning("LLM tried upgrade with insufficient gold")
 
 
 def is_buildable(state: GameState, x: int, y: int) -> bool:
@@ -292,6 +299,7 @@ def main():
     # Create the game and log some info
     state = GameState()
     logging.info("Starting Tower Defense Test for 2 waves.")
+    logging.info(state.get_map_string())  # Log initial map state
     
     print("Starting Tower Defense Benchmark (2 Waves)!")
     state.print_map()
@@ -304,6 +312,10 @@ def main():
         print(f"\n== Wave #{state.wave_number} (Preparation) ==")
         llm_json = get_llm_decision(state, current_wave)
         parse_llm_action(state, llm_json)
+        
+        # Log map state after planning phase
+        logging.info(f"Map state after Wave {state.wave_number} planning:" + state.get_map_string())
+        state.print_map()  # Also print to console
         
         # -- Combat Phase --
         print(f"\n== Wave #{state.wave_number} (Combat) ==")
